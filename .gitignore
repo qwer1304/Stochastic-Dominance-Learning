@@ -1,5 +1,8 @@
 __pycache__/
 venv/
-datasets/
+datasets/*
 results/*
 !results/.gitkeep 
+donotgit/*
+Stochastic-Dominance-Learning.tws
+checkpoints/*

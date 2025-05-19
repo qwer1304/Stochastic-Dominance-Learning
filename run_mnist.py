@@ -4,18 +4,20 @@ from absl import logging
 
 import jax
 from ml_collections import config_flags
-from flax.training import train_state
+from flax.training import checkpoints, train_state
 from flax import linen as nn
 import optax
 import jax.numpy as jnp
 from functools import partial
-import train
 from utils import TrainableModel, SDTrainState
 from sd_loss import sd_2nd_cdf, mean_risk
 # replay buffer
 import flashbax as fbx
 
-flags.DEFINE_string('workdir', '/tmp/mnist', 'Directory to store model data.')
+import train
+import prepare 
+
+flags.DEFINE_string('workdir', 'tmp/mnist', 'Directory to store model data.')
 config_flags.DEFINE_config_file(
     'config',
     'configs/default_mnist.py',
@@ -30,6 +32,8 @@ import torch.utils.data as data
 import torchvision
 from torchvision.datasets import MNIST
 from torchvision import transforms
+
+from os.path import abspath
 
 # Transformations applied on each image => bring them into a numpy array and normalize between -1 and 1
 def image_to_numpy(img):
@@ -48,13 +52,14 @@ def numpy_collate(batch):
         return np.array(batch)
 
 def get_dataloader(config):
-  train_dataset = MNIST(root=config.dataset_path, train=True, transform=image_to_numpy, download=True)
+  train_dataset = MNIST(root=config.dataset_path, train=True, transform=image_to_numpy, download=True) #  60,000 examples, @ batch=128 -> 468 batches
 
-  test_set = MNIST(root=config.dataset_path, train=False, transform=image_to_numpy, download=True)
+  test_set = MNIST(root=config.dataset_path, train=False, transform=image_to_numpy, download=True) # 10,000 examples, @ batch=128 -> 78 batches
+  # pin_memory: If True, the data loader will copy tensors into CUDA pinned memory before returning them.
+  train_loader = data.DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=numpy_collate, pin_memory=False)
 
-  train_loader = data.DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=numpy_collate, pin_memory=True)
-
-  test_loader  = data.DataLoader(test_set, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=numpy_collate, pin_memory=True)
+  test_loader  = data.DataLoader(test_set, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=numpy_collate, 
+            pin_memory=jax.default_backend()!="cpu")
   
   return train_loader, test_loader
 
@@ -83,13 +88,31 @@ class Trainer(TrainableModel):
     self.rng = jax.random.key(config.seed)
     self.model=CNN()
     self.state = None
-    self.buffer = fbx.make_item_buffer(**config.buffer_args)
+    # Item Buffer is a simple buffer that stores individual items. 
+    # It is useful for storing data that is independent of each other, such as 
+    # (observation, action, reward, discount, next_observation) tuples, or entire episodes.
+    self.buffer = fbx.make_item_buffer(**config.buffer_args) # create replay buffer, sample size is batch_size
     self.create_fn()
 
   def create_train_state(self, batch):
     """Creates initial `TrainState`."""
+    """
+    When we add parameters, optimiser states, and a bunch of other metrics to the return call of train_step 
+    it gets a bit unwieldy to handle all the state. 
+    It could get worse if we later need a more complex state. 
+    One solution would be to return a namedtuple so we can at least package the state together somewhat. 
+    However, Flax provides its own solution, flax.training.train_state.TrainState, which has some extra functions 
+    that make updating the combined state (model and optimiser state) easier.
+    """
     self.rng, init_rng = jax.random.split(self.rng)
     imgs, labels = batch
+    """
+    init takes as first argument either a single PRNGKey, or a dictionary mapping variable collections names to their PRNGKeys, 
+    and will call method (which is the module’s __call__ function by default) passing *args and **kwargs, and returns a dictionary 
+    of initialized variables.
+    If you pass a single PRNGKey, Flax will use it to feed the 'params' RNG stream. If you want to use a different RNG stream 
+    or need to use multiple streams, you can pass a dictionary mapping each RNG stream name to its corresponding PRNGKey to init.
+    """
     params = self.model.init(init_rng, imgs)['params']
     tx = optax.sgd(self.config.learning_rate, self.config.momentum)
     state = SDTrainState.create(apply_fn=self.model.apply, params=params, tx=tx)
@@ -98,10 +121,14 @@ class Trainer(TrainableModel):
     buffer_state = self.buffer.init(loss[0])
     buffer_state = self.buffer.add(buffer_state, loss[1:])
     state = state.replace(buffer_state=buffer_state)
-
+    
+    state = state.replace(xepoch=-1)
+    state = state.replace(xstep=-1)
+    
     self.state = state
 
   def create_fn(self):
+  # Creates jit compatible train_step and eval_step functions
 
     def calc_batch_loss(params, batch):
       imgs, labels = batch
@@ -112,6 +139,7 @@ class Trainer(TrainableModel):
       metrics = {'ce_loss': jnp.mean(batch_loss), 'accuracy': acc, 'batch_loss': batch_loss}
       return batch_loss, metrics
     
+    # Calculates the loss of the batch, including adjustments, if needed, for SD
     def calc_final_loss(batch_loss, batch_ref=None):
       ce_loss = jnp.mean(batch_loss)
       if self.config.loss == 'standard':
@@ -119,25 +147,26 @@ class Trainer(TrainableModel):
       elif self.config.loss == 'mean_risk':
         loss = mean_risk(batch_loss)
       elif self.config.loss == 'sd_2nd_cdf':
-        loss = sd_2nd_cdf(-batch_loss, -batch_ref)
+        loss = sd_2nd_cdf(-batch_loss, -batch_ref) # in sd_loss, get_utility=False
       return loss
 
     # Training function
     def train_step(state, batch, rng=None):
 
       def loss_fn(params):
-        batch_loss, metrics = calc_batch_loss(params, batch)
+        batch_loss, metrics = calc_batch_loss(params, batch) # cross-entropy over batch, standard classifier
         batch_ref = None
         if self.config.loss == 'sd_2nd_cdf':
-          batch_ref = self.buffer.sample(state.buffer_state, rng)['experience']
+          batch_ref = self.buffer.sample(state.buffer_state, rng)['experience'] # samples batch_size from replay buffer
         final_loss = calc_final_loss(batch_loss, batch_ref)
         return final_loss, metrics
 
+      # loss_fn should return a scalar (which includes arrays with shape () but not arrays with shape (1,) etc.)
       (final_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
 
       state = state.apply_gradients(grads=grads)
-      new_buffer_state = self.buffer.add(state.buffer_state, metrics['batch_loss'])
-      state = state.replace(buffer_state=new_buffer_state)
+      new_buffer_state = self.buffer.add(state.buffer_state, metrics['batch_loss']) # batch_loss are the losses of each example in the batch
+      state = state.replace(buffer_state=new_buffer_state) # update the buffer
       return state, metrics
     
     def eval_step(state, batch):
@@ -155,10 +184,12 @@ class Trainer(TrainableModel):
     else:
        return 'epoch:% 3d, train_loss: %.4f, train_accuracy: %.2f' \
       % (epoch, train_metrics['ce_loss'], train_metrics['accuracy'] * 100)
-
+      
 def main(argv):
-  if len(argv) > 1:
+  if len(argv) > 1: # argv[0] is script name
     raise app.UsageError('Too many command-line arguments.')
+ 
+  logging.set_verbosity(logging.WARNING)
   
   logging.info('JAX process: %d / %d', jax.process_index(), jax.process_count())
   logging.info('JAX local devices: %r', jax.local_devices())
@@ -169,7 +200,16 @@ def main(argv):
   seed = 0
   config.seed = seed
   torch.manual_seed(config.seed)
-  train.train_and_evaluate(config, Trainer(config), get_dataloader, FLAGS.workdir)
+  checkpoint_dir = abspath("./checkpoints/mnist")  # now absolute
+  """
+  Trainer() initializes jax RNG.
+  prepare() -> maybe_restore_checkpoint() 
+    -> setup() to initialize everything to defaults
+    -> manager.restore() to restore state (including RNG)
+  """
+  manager, trainer, config = prepare.prepare(config, Trainer(config), get_dataloader, checkpoint_dir)
+  
+  train.train_and_evaluate(config, trainer, manager, get_dataloader, FLAGS.workdir)
 
   # for seed in range(10):
   #   config.seed = seed

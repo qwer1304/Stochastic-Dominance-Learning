@@ -12,6 +12,8 @@ def get_config():
   config.momentum = 0.9
   config.batch_size = 128
   config.num_epochs = 200
+  config.checkpoint_every_epochs = 1
+
   
   loss_list = ['standard', 'sd_2nd_cdf', 'mean_risk']
   config.loss = loss_list[1]

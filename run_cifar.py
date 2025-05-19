@@ -10,12 +10,14 @@ import optax
 import jax.numpy as jnp
 from functools import partial
 import train
+import prepare 
+
 from utils import TrainableModel, SDTrainState
 from sd_loss import sd_2nd_cdf, mean_risk
 # replay buffer
 import flashbax as fbx
 
-flags.DEFINE_string('workdir', '/tmp/cifar', 'Directory to store model data.')
+flags.DEFINE_string('workdir', 'tmp/cifar', 'Directory to store model data.')
 config_flags.DEFINE_config_file(
     'config',
     'configs/default_cifar.py',
@@ -31,6 +33,8 @@ import torchvision
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
 # import tensorflow as tf
+
+from os.path import abspath
 
 data_means = jnp.array([0.49139968,0.48215841,0.44653091])
 data_std = jnp.array([0.24703223,0.24348513,0.26158784])
@@ -63,9 +67,10 @@ def get_dataloader(config):
 
   test_set = CIFAR10(root=config.dataset_path, train=False, transform=test_transform, download=True)
 
-  train_loader = data.DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=numpy_collate, pin_memory=True)
+  train_loader = data.DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=True, collate_fn=numpy_collate, 
+        pin_memory=jax.default_backend()!="cpu")
 
-  test_loader  = data.DataLoader(test_set, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=numpy_collate, pin_memory=True)
+  test_loader  = data.DataLoader(test_set, batch_size=config.batch_size, shuffle=False, drop_last=False, collate_fn=numpy_collate, pin_memory=False)
   
   return train_loader, test_loader
 
@@ -187,6 +192,9 @@ class Trainer(TrainableModel):
     buffer_state = self.buffer.init(loss[0])
     buffer_state = self.buffer.add(buffer_state, loss[1:])
     state = state.replace(buffer_state=buffer_state)
+    state = state.replace(xepoch=-1)
+    state = state.replace(xstep=-1)
+ 
     self.state = state
 
   def create_fn(self):
@@ -268,10 +276,20 @@ def main(argv):
 
   config = FLAGS.config
 
+  logging.set_verbosity(logging.WARNING)
   seed = 0
   config.seed = seed
   torch.manual_seed(config.seed)
-  train.train_and_evaluate(config, Trainer(config), get_dataloader, FLAGS.workdir)
+  checkpoint_dir = abspath("./checkpoints/cifar")  # now absolute
+  """
+  Trainer() initializes jax RNG.
+  prepare() -> maybe_restore_checkpoint() 
+    -> setup() to initialize everything to defaults
+    -> manager.restore() to restore state (including RNG)
+  """
+  manager, trainer, config = prepare.prepare(config, Trainer(config), get_dataloader, checkpoint_dir)
+
+  train.train_and_evaluate(config, trainer, manager, get_dataloader, FLAGS.workdir)
 
   # for seed in range(10):
   #   config.seed = seed

@@ -7,11 +7,12 @@ import ml_collections
 from collections import defaultdict
 import numpy as np
 import optax
-from utils import TrainableModel
+from utils import TrainableModel, to_plain_dict, flatten_and_convert_metrics
 import pickle
 ## Progress bar
 from tqdm.auto import tqdm
 from pathlib import Path
+import orbax.checkpoint as ocp
 
 def update_metrics_batch(epoch_metrics, batch_metrics):
   for metric in batch_metrics:
@@ -35,8 +36,28 @@ def update_metrics_epoch(epoch_metrics):
       epoch_metrics[metric] = np.mean(epoch_metrics[metric])
   return
 
+# ================================
+# SAVE CHECKPOINT
+# ================================
+def save_checkpoint(manager, trainer, config, epoch, step, train_metrics, test_metrics):
+          
+      metrics = flatten_and_convert_metrics({'train': train_metrics, 'test': test_metrics})
+      
+      config_dict = to_plain_dict(config)
+      
+      manager.save(
+            step,
+            args=ocp.args.Composite(
+              state=ocp.args.StandardSave(trainer.state),
+              rng=ocp.args.JaxRandomKeySave(trainer.rng),
+              config=ocp.args.JsonSave(config_dict),
+            ),
+            metrics=metrics
+      )
+      #manager.save(step, args=ocp.args.StandardSave(trainer.state), metrics=metrics)
+
 def train_and_evaluate(
-    config: ml_collections.ConfigDict, trainer: TrainableModel, get_dataloader, workdir: str
+    config: ml_collections.ConfigDict, trainer: TrainableModel, manager, get_dataloader, workdir: str
 ) -> train_state.TrainState:
   """Execute model training and evaluation loop.
 
@@ -46,32 +67,42 @@ def train_and_evaluate(
   Returns:
     The train state (which includes the `.params`).
   """
-
   train_loader, test_loader = get_dataloader(config)
 
-  trainer.create_train_state(next(iter(train_loader)))
+  #trainer.create_train_state(next(iter(train_loader)))
 
-  for epoch in range(1, config.num_epochs + 1):
+  # Over epochs:
+  start_epoch = trainer.state.xepoch + 1 # xepoch was the last epoch completed in checkpoint, so start from next
+  step = trainer.state.xstep + 1 # ditto for step
+  for epoch in range(start_epoch, config.num_epochs):
 
+    # Perform training
     train_metrics = defaultdict(list)
     train_metrics['epoch'] = epoch
+    # Over batches in each epoch:
+    # This corresponds to Algorithm 1, with the computation of u^* on Line 6 done with Algorithm 2 
+    # and sampling of X_{theta_t}^N with a replay buffer 
     for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False):
+      # Generate 2 independent pseudorandom values given a single key.
       trainer.rng, rng = jax.random.split(trainer.rng)
-      trainer.state, metrics = trainer.train_step(trainer.state, batch, rng)
+      # Do one train step
+      trainer.state, metrics = trainer.train_step(trainer.state, batch, rng) # in run_mnist
       update_metrics_batch(train_metrics, metrics)
+      step += 1
     update_metrics_epoch(train_metrics)      
 
+    # Perform evaluation
     test_metrics = None
     eval_flag = (epoch % 1 == 0) or (epoch == config.num_epochs)
     if eval_flag:
       test_metrics = defaultdict(list)
       test_metrics['epoch'] = epoch
       for batch in tqdm(test_loader, desc=f"Epoch {epoch}", leave=False):
-        _, metrics = trainer.eval_step(trainer.state, batch)
+        _, metrics = trainer.eval_step(trainer.state, batch) # in run_mnist
         update_metrics_batch(test_metrics, metrics)
       update_metrics_epoch(test_metrics)      
         
-    logging.info(trainer.format_log(epoch, train_metrics, test_metrics))
+    logging.warning(trainer.format_log(epoch, train_metrics, test_metrics))
 
     if config.save_log and eval_flag:
       train_metrics['method'] = config.loss
@@ -95,3 +126,9 @@ def train_and_evaluate(
       with open(filename, 'wb') as f:
         pickle.dump(all_train_metrics, f)
         pickle.dump(all_test_metrics, f)
+        
+    trainer.state = trainer.state.replace(xepoch=epoch, xstep=step)
+    if epoch % config.checkpoint_every_epochs == 0:
+      # Save
+      save_checkpoint(manager, trainer, config, epoch, step, train_metrics, test_metrics)
+

@@ -26,10 +26,13 @@ def get_config():
   config.momentum = 0.9
   config.batch_size = 128
   config.num_epochs = 10
+  config.checkpoint_every_epochs = 1
 
   loss_list = ['standard', 'sd_2nd_cdf', 'mean_risk']
   config.loss = loss_list[1]
-
+  
+  # add_batches: Whether adding data in batches to the buffer.
+  #   If False, single transitions or single sequences are being added each time add is called. Defaults to False.
   config.buffer_args = {'max_length': 10*config.batch_size, 'min_length': config.batch_size, 'sample_batch_size': config.batch_size, 'add_batches': True}
 
   config.seed = 0
