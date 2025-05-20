@@ -213,7 +213,7 @@ def main(argv):
   """
   manager, trainer, config = prepare.prepare(config, Trainer(config), get_dataloader, checkpoint_dir)
   # test saving a checkpoint to skip waiting for epoch completion 
-  if True:
+  if False:
       train_metrics = defaultdict(list)
       train_metrics['epoch'] = 0
       test_metrics = defaultdict(list)
