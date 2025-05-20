@@ -13,9 +13,11 @@ from utils import TrainableModel, SDTrainState
 from sd_loss import sd_2nd_cdf, mean_risk
 # replay buffer
 import flashbax as fbx
+from collections import defaultdict
 
 import train
 import prepare 
+from time import sleep
 
 flags.DEFINE_string('workdir', 'tmp/mnist', 'Directory to store model data.')
 config_flags.DEFINE_config_file(
@@ -189,18 +191,20 @@ def main(argv):
   if len(argv) > 1: # argv[0] is script name
     raise app.UsageError('Too many command-line arguments.')
  
-  logging.set_verbosity(logging.WARNING)
-  
   logging.info('JAX process: %d / %d', jax.process_index(), jax.process_count())
   logging.info('JAX local devices: %r', jax.local_devices())
 
+  # orbax fills the log with info logs which cannot be suppressed.
+  # Suppress info logs and use warnings to output your info
+  logging.set_verbosity(logging.WARNING)
+ 
   DATASET_PATH = FLAGS.workdir
   config = FLAGS.config
 
   seed = 0
   config.seed = seed
   torch.manual_seed(config.seed)
-  checkpoint_dir = abspath("./checkpoints/mnist")  # now absolute
+  checkpoint_dir = abspath("./checkpoints/mnist/seed_"+str(seed))  # now absolute
   """
   Trainer() initializes jax RNG.
   prepare() -> maybe_restore_checkpoint() 
@@ -208,15 +212,27 @@ def main(argv):
     -> manager.restore() to restore state (including RNG)
   """
   manager, trainer, config = prepare.prepare(config, Trainer(config), get_dataloader, checkpoint_dir)
+  # test saving a checkpoint to skip waiting for epoch completion 
+  if True:
+      train_metrics = defaultdict(list)
+      train_metrics['epoch'] = 0
+      test_metrics = defaultdict(list)
+      test_metrics['epoch'] = 0
+      train.save_checkpoint(manager, trainer, config, 0, 0, train_metrics, test_metrics)
+      sleep(3) # let checkpointer complete in background
+      exit()
   
   train.train_and_evaluate(config, trainer, manager, get_dataloader, FLAGS.workdir)
+
 
   # for seed in range(10):
   #   config.seed = seed
   #   torch.manual_seed(config.seed)
+  #   checkpoint_dir = abspath("./checkpoints/mnist/seed_"+str(seed))  # now absolute
   #   for loss in ['standard', 'sd_2nd_cdf']:
   #     config.loss = loss
-  #     train.train_and_evaluate(config, Trainer(config), get_dataloader, FLAGS.workdir)
+  #     manager, trainer, config = prepare.prepare(config, Trainer(config), get_dataloader, checkpoint_dir)
+  #     train.train_and_evaluate(config, trainer, manager, get_dataloader, FLAGS.workdir)
 
 if __name__ == '__main__':
   flags.mark_flags_as_required(['config', 'workdir'])

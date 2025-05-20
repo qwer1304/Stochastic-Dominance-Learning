@@ -22,13 +22,15 @@ def create_ckpt_manager(ckpt_dir):
         orbax_logger = QuietLogger()
         return orbax_logger
 
-    options = ocp.CheckpointManagerOptions(max_to_keep=3, prevent_write_metrics=False, best_fn=lambda metrics: 0)  
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, prevent_write_metrics=False, 
+        best_fn=lambda metrics: 0)  
     # Create a CheckpointManager with the correct directory and target structure
     logger = setup_logger()
     manager = ocp.CheckpointManager(
         ckpt_dir,
         logger=logger,
-        options=options
+        options=options,
+        metadata={'version': 1.1, 'lang': 'en'}
     )
     return manager
 
